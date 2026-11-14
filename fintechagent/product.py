@@ -1,38 +1,64 @@
+"""Credit-card product catalogue loaded from plain-text files.
+
+Each file in the products folder is named ``"<segment> - <title>"`` and contains
+the product description used as context for the LLM.
+"""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List
 from pathlib import Path
-import os
+
+from .errors import DataError
+
+DEFAULT_SEGMENT = "generic"
 
 
-@dataclass
+@dataclass(frozen=True)
 class Product:
     title: str
     content: str
     segment: str
 
 
-class Products:
-    def __init__(self, products: List[Product]):
-        self.products = products
-        self.default_product: Product = None
-        for product in self.products:
-            if product.segment == "generic":
-                self.default_product = product
-        if self.default_product is None:
-            raise ValueError("Cannot found generic product")
+def parse_product_filename(filename: str) -> tuple[str, str]:
+    """Split ``"segment - Title-with-dashes"`` into ``(segment, title)``."""
+    segment, sep, title = filename.partition("-")
+    segment, title = segment.strip().lower(), title.strip()
+    if not sep or not segment or not title:
+        raise DataError(f"Invalid product file name '{filename}'. Expected '<segment> - <title>'.")
+    return segment, title
 
-    def __str__(self):
-        return f"{self.products}"
+
+class Products:
+    def __init__(self, products: list[Product]):
+        self.products = products
+        default = next((p for p in products if p.segment == DEFAULT_SEGMENT), None)
+        if default is None:
+            raise DataError(f"No '{DEFAULT_SEGMENT}' product found; one is required as a fallback.")
+        self.default_product: Product = default
+
+    def __repr__(self) -> str:
+        return f"Products({self.products!r})"
+
+    def for_segment(self, segment: str) -> Product:
+        """Return the product matching ``segment`` or the generic fallback."""
+        wanted = segment.strip().lower()
+        return next((p for p in self.products if p.segment == wanted), self.default_product)
 
     @classmethod
-    def fetch_from_folder(cls, folder_path: str):
+    def fetch_from_folder(cls, folder_path: str | Path) -> Products:
+        folder = Path(folder_path)
+        if not folder.is_dir():
+            raise DataError(f"Products folder not found at '{folder}'.")
         products = []
-        folder_path = Path(folder_path)
-        files = os.listdir(folder_path)
-        for file in files:
-            segment, title = file.split("-")
-            with open(folder_path / file, "r") as fileobj:
-                data = fileobj.read()
-            p = Product(title=title.strip(), content=data, segment=segment.strip())
-            products.append(p)
-        return Products(products)
+        # Sorted for deterministic ordering; hidden files (.DS_Store etc.) skipped.
+        for file in sorted(folder.iterdir()):
+            if not file.is_file() or file.name.startswith("."):
+                continue
+            segment, title = parse_product_filename(file.name)
+            content = file.read_text(encoding="utf-8").strip()
+            if not content:
+                raise DataError(f"Product file '{file.name}' is empty.")
+            products.append(Product(title=title, content=content, segment=segment))
+        return cls(products)
