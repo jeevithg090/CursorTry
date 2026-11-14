@@ -1,178 +1,116 @@
-from .cutomer import Customer
-from .product import Product
-from .defaults import SarvamAIPaths
-from dataclasses import dataclass
-import requests
-import json
+"""The sales-pitch conversation loop and its input/output channels."""
+
+from __future__ import annotations
+
 import logging
-import base64
+from collections.abc import Callable
+from typing import Protocol
+
 from .audio import PlayAudio
-import os
+from .customer import Customer
+from .product import Product
+from .sarvam import Answer, Question, Sarvam
+from .text import DEFAULT_STOP_WORDS, chunk_text, is_stop_request
 
 logger = logging.getLogger(__name__)
 
+PITCH_QUESTION = (
+    "Generate shortest sales pitch text for sales representative describing about "
+    "the credit card information shared."
+)
+PITCH_DESCRIPTION = "prepare sales pitch as short as possible explaining about the benefits"
+FOLLOW_UP_DESCRIPTION = "Answer customer's question with provided context."
+GOODBYE = "Thank you! Hope I served you well."
+DIDNT_CATCH = "Sorry, I didn't catch that. Could you please repeat your question?"
+
+
+class LLM(Protocol):
+    def answer(self, context: str, question: Question, description: str) -> Answer: ...
+
+
+class Channel(Protocol):
+    """How the agent talks to the customer."""
+
+    def say(self, text: str) -> None: ...
+
+    def listen(self) -> str: ...
+
+
+class VoiceChannel:
+    """Speaks via Sarvam TTS + speakers and listens via microphone + Sarvam STT."""
+
+    def __init__(self, sarvam: Sarvam, player: PlayAudio | None = None):
+        self.sarvam = sarvam
+        self.player = player or PlayAudio()
+
+    def say(self, text: str) -> None:
+        chunks = chunk_text(text)
+        for index, chunk in enumerate(chunks, start=1):
+            logger.debug("Playing audio part %d/%d", index, len(chunks))
+            self.player.play(self.sarvam.tts(chunk).audio)
+
+    def listen(self) -> str:
+        audio = self.player.record()
+        logger.debug("Captured %d bytes of audio", len(audio))
+        return self.sarvam.stt(audio).text
+
+
+class TextChannel:
+    """Prints replies and reads questions from the keyboard (no audio needed)."""
+
+    def __init__(
+        self,
+        output: Callable[[str], None] | None = None,
+        read: Callable[[str], str] | None = None,
+    ):
+        # Resolved lazily so builtins can be swapped (e.g. in tests or a REPL).
+        self.output = output or (lambda text: print(text, flush=True))
+        self.read = read or (lambda prompt: input(prompt))  # noqa: PLW0108
+
+    def say(self, text: str) -> None:
+        self.output(f"\nBulBul: {text}")
+
+    def listen(self) -> str:
+        try:
+            return self.read("\nYou: ")
+        except EOFError:
+            return "stop"
+
 
 class Agent:
-    stop_words = ["Close", "Stop"]
+    """Pitches ``product`` to ``customer`` and answers follow-up questions."""
 
-    def __init__(self, sarvam: "Sarvam"):
-        self.llm = sarvam
-        self.pa = PlayAudio()
+    def __init__(
+        self,
+        llm: LLM,
+        channel: Channel,
+        stop_words: tuple[str, ...] = DEFAULT_STOP_WORDS,
+        max_turns: int | None = None,
+    ):
+        self.llm = llm
+        self.channel = channel
+        self.stop_words = stop_words
+        self.max_turns = max_turns
 
-    def converse(self, customer: Customer, product: Product):
-        # Sales Agent Initial Pitch
-        question = "Generate shortest sales pitch text for sales representative describing about the credit card information shared."
-        description = (
-            "prepare sales pitch as short as possible explaining about the benefits"
-        )
-        customer_interactions = 0
-        logger.info("Generating Initial Sales Pitch")
-        while True:
-            logger.info("Customer Interactions: %d", customer_interactions)
+    def converse(self, customer: Customer, product: Product) -> int:
+        """Run the conversation; returns the number of customer questions answered."""
+        logger.info("Generating initial sales pitch of %s for %s", product.title, customer.name)
+        pitch = self.llm.answer(product.content, Question(PITCH_QUESTION, 0), PITCH_DESCRIPTION)
+        self.channel.say(pitch.response)
+
+        turns = 0
+        while self.max_turns is None or turns < self.max_turns:
+            utterance = self.channel.listen().strip()
+            if not utterance:
+                self.channel.say(DIDNT_CATCH)
+                continue
+            if is_stop_request(utterance, self.stop_words):
+                break
+            turns += 1
+            logger.info("Answering customer question #%d", turns)
             answer = self.llm.answer(
-                product.content,
-                Question(question=question, id=customer_interactions),
-                description,
+                product.content, Question(utterance, turns), FOLLOW_UP_DESCRIPTION
             )
-            # Overcomes sarvam AI's 500 character limit
-            n_iters = len(answer.response) // 499
-            for n in range(n_iters + 1):
-                response = self.llm.tts(answer.response[n * 499 : (n + 1) * 499])
-                logger.info("Playing %d/%d audio_part", n + 1, n_iters + 1)
-                self.pa.play(response.audio)
-            logger.info("Expecting input from the customer")
-            customer_audio = self.pa.record()
-            customer_interactions += 1
-            logger.info("Converting customer's speech to text")
-            logger.info(
-                "Length of Customer Audio in no: of bytes %d", len(customer_audio)
-            )
-            stt = self.llm.stt(customer_audio)
-            question = stt.text
-            description = "Answer customer's question with provided context."
-            for sp in self.stop_words:
-                if sp in question or sp.lower() in question:
-                    response = self.llm.tts("Thank you! Hope I served you better")
-                    self.pa.play(response.audio)
-                    return
-
-
-@dataclass
-class Answer:
-    question: "Question"
-    response: str
-    reasoning: str
-    utterance: str
-
-
-@dataclass
-class Question:
-    question: str
-    id: int
-
-
-@dataclass
-class TTS:
-    audio: bytes
-    text: str
-
-
-@dataclass
-class STT:
-    text: str
-    lang_code: str
-
-
-class Sarvam:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.common_headers = {"api-subscription-key": self.api_key}
-
-    @classmethod
-    def from_env(cls):
-        return Sarvam(os.environ["SARVAM_AI_API"])
-
-    def answer(self, context: str, question: Question, description: str):
-        url = f"{SarvamAIPaths.url}/{SarvamAIPaths.text_analytics}"
-        headers = {
-            **self.common_headers,
-        }
-        data = {
-            "text": context,
-            "questions": json.dumps(
-                [
-                    {
-                        "id": f"{question.id}",
-                        "text": question.question,
-                        "description": description,
-                        "type": "short answer",
-                        "properties": {},
-                    }
-                ]
-            ),
-        }
-        try:
-            response = requests.post(url=url, headers=headers, data=data)
-            if response.status_code != 200:
-                raise ValueError(
-                    f"Response from Sarvam Failed with status code: {response.status_code} for {response.text}"
-                )
-            resp = response.json()["answers"][0]
-            return Answer(
-                response=resp["response"],
-                reasoning=resp["reasoning"],
-                utterance=resp["utterance"],
-                question=question,
-            )
-        except Exception as e:
-            logger.exception("Sarvam Response Error for text-analytics.")
-            raise e
-
-    def tts(self, text: str):
-        url = f"{SarvamAIPaths.url}/{SarvamAIPaths.tts}"
-        headers = {
-            **self.common_headers,
-        }
-        # THe default params didn't work data = {"inputs": [text], "target_language_code": "hi-IN"}
-        data = {
-            "inputs": [text],
-            "target_language_code": "en-IN",
-            "speaker": "meera",
-            "pitch": 0,
-            "loudness": 1.5,
-            "speech_sample_rate": 8000,
-            "enable_preprocessing": False,
-            "model": "bulbul:v1",
-        }
-        try:
-            response = requests.post(url=url, headers=headers, json=data)
-            if response.status_code != 200:
-                raise ValueError(
-                    f"Response from Sarvam Failed with status code: {response.status_code} for {response.text}"
-                )
-            resp = response.json()
-            return TTS(audio=base64.b64decode(resp["audios"][0]), text=text)
-        except Exception as e:
-            logger.exception("Sarvam Response Error for tts")
-            raise e
-
-    def stt(self, audio: bytes):
-        url = f"{SarvamAIPaths.url}/{SarvamAIPaths.stt}"
-        headers = {
-            **self.common_headers,
-        }
-        multiform_data = {
-            "file": ("fixed.wav", audio, "audio/wav"),
-        }
-        try:
-            response = requests.post(url, headers=headers, files=multiform_data)
-            if response.status_code != 200:
-                raise ValueError(
-                    f"Response from Sarvam Failed with status code: {response.status_code} for {response.text}"
-                )
-            resp = response.json()
-
-            return STT(text=resp["transcript"], lang_code=resp["language_code"])
-        except Exception as e:
-            logger.exception("Sarvam Response Error for tts")
-            raise e
+            self.channel.say(answer.response)
+        self.channel.say(GOODBYE)
+        return turns
